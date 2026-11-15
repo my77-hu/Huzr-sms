@@ -1,45 +1,80 @@
 import subprocess
-import json
+import re
+import sqlite3
+import os
 
-# عنوان الهاتف الذي حددناه
-PHONES = [
-    {"name": "هاتف_تجربة_1", "ip": "10.179.39.245:5555"},
-]
-
-def get_phone_sms(device_ip):
+def get_adb_connection_info():
+    """جلب الـ IP والمنفذ النشط للتصحيح اللاسلكي تلقائياً من النظام"""
     try:
-        print(f"[*] جاري الاتصال بالهاتف وجلب الرسائل المخزنة من: {device_ip}")
-        # الاتصال بالهاتف لاسلكياً عبر adb
-        subprocess.run(["adb", "connect", device_ip], capture_output=True, timeout=5)
-        
-        # تنفيذ أمر قراءة صندوق الوارد (SMS Inbox) بالكامل للرسائل السابقة
-        cmd = ["adb", "-s", device_ip, "shell", "content query --uri content://sms/inbox --projection address:body:date"]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-        
+        # تنفيذ أمر لجلب حالة اتصالات الـ adb النشطة على الجهاز محلياً
+        result = subprocess.run(['adb', 'devices'], capture_output=True, text=True)
         output = result.stdout
-        messages = []
         
-        for line in output.splitlines():
-            if "Row:" in line or "address=" in line or "body=" in line:
-                messages.append(line)
-                
-        return messages
-    except Exception as e:
-        print(f"[-] فشل الاتصال بالهاتف {device_ip}: {e}")
-        return []
+        # البحث عن اتصال لاسلكي قائم
+        lines = output.strip().split('\n')
+        for line in lines:
+            if ':' in line and 'device' in line:
+                parts = line.split()[0].split(':')
+                return parts[0], int(parts[1])
+    except Exception:
+        pass
+    return None, None
 
-def main():
-    print("[+] بدء جلب الرسائل النصية القديمة المخزنة على الأجهزة...\n")
+def monitor_sms():
+    print("[*] جاري فحص والتحقق من الاتصال اللاسلكي للـ ADB تلقائياً...")
     
-    for phone in PHONES:
-        sms_list = get_phone_sms(phone['ip'])
-        
-        if sms_list:
-            print(f"\n[+] تم بنجاح العثور على {len(sms_list)} سجل/رسالة في هاتفك:")
-            for sms in sms_list:
-                print(f"  {sms}")
-        else:
-            print(f"[-] لم يتم العثور على رسائل أو تعذر الاتصال بـ {phone['name']}.")
+    # محاولة إعادة تشغيل الخادم وتفعيل الاتصال المحلي المضمون لاسلكياً
+    subprocess.run(['adb', 'start-server'], capture_output=True)
+    
+    # جلب معلومات الاتصال النشطة
+    ip, port = get_adb_connection_info()
+    
+    if not ip:
+        # إذا لم يكن متصلاً، نقوم بالربط التلقائي عبر المنفذ المحلي الافتراضي لاسلكياً
+        print("[*] جارٍ تفعيل الجسر اللاسلكي المحلي...")
+        subprocess.run(['adb', 'connect', '127.0.0.1:5555'], capture_output=True)
+        ip, port = "127.0.0.1", 5555
+
+    print(f"[+] الاتصال اللاسلكي نشط على: {ip}:{port}")
+    
+    # مسار قاعدة بيانات الرسائل في أندرويد لجميع الشرائح
+    sms_paths = [
+        "/data/data/com.android.providers.telephony/databases/mmssms.db",
+        "/data/user/0/com.android.providers.telephony/databases/mmssms.db"
+    ]
+    
+    success = False
+    for sms_path in sms_paths:
+        try:
+            # استخدام أداة adb لنسخ قاعدة بيانات الرسائل مؤقتاً وقراءتها لاسلكياً
+            local_db = "temp_sms.db"
+            pull_cmd = f"adb pull {sms_path} {local_db}"
+            res = subprocess.run(pull_cmd, shell=True, capture_output=True, text=True)
+            
+            if res.returncode == 0 and os.path.exists(local_db):
+                conn = sqlite3.connect(local_db)
+                cursor = conn.cursor()
+                
+                # جلب الرسائل الواردة لجميع الشرائح (sub_id أو address)
+                cursor.execute("SELECT address, body, date, sub_id FROM sms WHERE type=1 ORDER BY date DESC LIMIT 20;")
+                messages = cursor.fetchall()
+                
+                if messages:
+                    print(f"\n[+] تم بنجاح سحب رسائل الشرائح لاسلكياً ({len(messages)} رسالة):\n" + "-"*50)
+                    for idx, (address, body, date, sub_id) in enumerate(messages, 1):
+                        print(f"[{idx}] الشريحة (SIM ID): {sub_id}")
+                        print(f"    المرسل: {address}")
+                        print(f"    النص: {body}")
+                        print("-" * 50)
+                    success = True
+                conn.close()
+                os.remove(local_db)
+                break
+        except Exception as e:
+            continue
+            
+    if not success:
+        print("[-] تعذر سحب قاعدة البيانات مباشرة، تأكد من أن الاتصال اللاسلكي يعمل وصلاحيات التخزين متاحة.")
 
 if __name__ == "__main__":
-    main()
+    monitor_sms()
